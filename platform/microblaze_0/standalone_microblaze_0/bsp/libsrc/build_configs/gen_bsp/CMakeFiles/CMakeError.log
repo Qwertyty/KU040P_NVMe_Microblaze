@@ -1,0 +1,26 @@
+Compiling the C compiler identification source file "CMakeCCompilerId.c" failed.
+Compiler: D:/soft/xilinx/2025.2.1/Vitis/gnu/microblaze/nt/bin/mb-gcc.exe 
+Build flags: ;;-mxl-barrel-shift;-mlittle-endian;-mxl-pattern-compare;-mno-xl-soft-mul;-mxl-multiply-high;-mno-xl-soft-div;-mcpu=v11.0;-DSDT;;-MMD;-MP;-specs=C:/Users/qwerty/Desktop/yscc_proj6/platform/microblaze_0/standalone_microblaze_0/bsp/Xilinx.spec;-IC:/Users/qwerty/Desktop/yscc_proj6/platform/microblaze_0/standalone_microblaze_0/bsp/include
+Id flags:  
+
+The output was:
+1
+D:/soft/xilinx/2025.2.1/gnu/microblaze/nt/x86_64-oesdk-mingw32/usr/bin/microblaze-xilinx-elf/../../libexec/microblaze-xilinx-elf/gcc/microblaze-xilinx-elf/13.3.0/ld.exe: cannot find -lxil: No such file or directory
+collect2.exe: error: ld returned 1 exit status
+
+
+The C compiler identification could not be found in "C:/Users/qwerty/Desktop/yscc_proj6/platform/microblaze_0/standalone_microblaze_0/bsp/libsrc/build_configs/gen_bsp/CMakeFiles/3.24.2/CompilerIdC/CMakeCCompilerId.d"
+
+Compiling the CXX compiler identification source file "CMakeCXXCompilerId.cpp" failed.
+Compiler: D:/soft/xilinx/2025.2.1/Vitis/gnu/microblaze/nt/bin/mb-g++.exe 
+Build flags: ;;-mxl-barrel-shift;-mlittle-endian;-mxl-pattern-compare;-mno-xl-soft-mul;-mxl-multiply-high;-mno-xl-soft-div;-mcpu=v11.0;-DSDT;;-MMD;-MP;-specs=C:/Users/qwerty/Desktop/yscc_proj6/platform/microblaze_0/standalone_microblaze_0/bsp/Xilinx.spec;-IC:/Users/qwerty/Desktop/yscc_proj6/platform/microblaze_0/standalone_microblaze_0/bsp/include
+Id flags:  
+
+The output was:
+1
+D:/soft/xilinx/2025.2.1/gnu/microblaze/nt/x86_64-oesdk-mingw32/usr/bin/microblaze-xilinx-elf/../../libexec/microblaze-xilinx-elf/gcc/microblaze-xilinx-elf/13.3.0/ld.exe: cannot find -lxil: No such file or directory
+collect2.exe: error: ld returned 1 exit status
+
+
+The CXX compiler identification could not be found in "C:/Users/qwerty/Desktop/yscc_proj6/platform/microblaze_0/standalone_microblaze_0/bsp/libsrc/build_configs/gen_bsp/CMakeFiles/3.24.2/CompilerIdCXX/CMakeCXXCompilerId.d"
+

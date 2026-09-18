@@ -1,0 +1,25 @@
+# ninja log v5
+16	970	0	CMakeFiles/axipcie_example	b6333c384a261021
+16	970	0	xaxipcie_exlist.yaml	b6333c384a261021
+16	970	0	C:/Users/qwerty/Desktop/yscc_proj6/platform/microblaze_0/standalone_microblaze_0/bsp/libsrc/build_configs/exmetadata/CMakeFiles/axipcie_example	b6333c384a261021
+16	970	0	C:/Users/qwerty/Desktop/yscc_proj6/platform/microblaze_0/standalone_microblaze_0/bsp/libsrc/build_configs/exmetadata/xaxipcie_exlist.yaml	b6333c384a261021
+9	987	0	CMakeFiles/intc_example	c77c6dd50a4592f5
+9	987	0	xintc_exlist.yaml	c77c6dd50a4592f5
+9	987	0	C:/Users/qwerty/Desktop/yscc_proj6/platform/microblaze_0/standalone_microblaze_0/bsp/libsrc/build_configs/exmetadata/CMakeFiles/intc_example	c77c6dd50a4592f5
+9	987	0	C:/Users/qwerty/Desktop/yscc_proj6/platform/microblaze_0/standalone_microblaze_0/bsp/libsrc/build_configs/exmetadata/xintc_exlist.yaml	c77c6dd50a4592f5
+2	988	0	CMakeFiles/axidma_example	3b7c656f2676fba1
+2	988	0	xaxidma_exlist.yaml	3b7c656f2676fba1
+2	988	0	C:/Users/qwerty/Desktop/yscc_proj6/platform/microblaze_0/standalone_microblaze_0/bsp/libsrc/build_configs/exmetadata/CMakeFiles/axidma_example	3b7c656f2676fba1
+2	988	0	C:/Users/qwerty/Desktop/yscc_proj6/platform/microblaze_0/standalone_microblaze_0/bsp/libsrc/build_configs/exmetadata/xaxidma_exlist.yaml	3b7c656f2676fba1
+42	999	0	CMakeFiles/bram_example	fd3e21ab2b287ed1
+42	999	0	xbram_exlist.yaml	fd3e21ab2b287ed1
+42	999	0	C:/Users/qwerty/Desktop/yscc_proj6/platform/microblaze_0/standalone_microblaze_0/bsp/libsrc/build_configs/exmetadata/CMakeFiles/bram_example	fd3e21ab2b287ed1
+42	999	0	C:/Users/qwerty/Desktop/yscc_proj6/platform/microblaze_0/standalone_microblaze_0/bsp/libsrc/build_configs/exmetadata/xbram_exlist.yaml	fd3e21ab2b287ed1
+33	1003	0	CMakeFiles/uartlite_example	931022c71fe4f627
+33	1003	0	xuartlite_exlist.yaml	931022c71fe4f627
+33	1003	0	C:/Users/qwerty/Desktop/yscc_proj6/platform/microblaze_0/standalone_microblaze_0/bsp/libsrc/build_configs/exmetadata/CMakeFiles/uartlite_example	931022c71fe4f627
+33	1003	0	C:/Users/qwerty/Desktop/yscc_proj6/platform/microblaze_0/standalone_microblaze_0/bsp/libsrc/build_configs/exmetadata/xuartlite_exlist.yaml	931022c71fe4f627
+23	1007	0	CMakeFiles/tmrctr_example	e5e1529d39ba0b30
+23	1007	0	xtmrctr_exlist.yaml	e5e1529d39ba0b30
+23	1007	0	C:/Users/qwerty/Desktop/yscc_proj6/platform/microblaze_0/standalone_microblaze_0/bsp/libsrc/build_configs/exmetadata/CMakeFiles/tmrctr_example	e5e1529d39ba0b30
+23	1007	0	C:/Users/qwerty/Desktop/yscc_proj6/platform/microblaze_0/standalone_microblaze_0/bsp/libsrc/build_configs/exmetadata/xtmrctr_exlist.yaml	e5e1529d39ba0b30
