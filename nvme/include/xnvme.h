@@ -119,7 +119,7 @@ int  XNvme_WriteChannels(XNvme *nv, u32 nch,
  * The verbose bring-up logs are muted for the timed windows automatically.
  * Writes go to lbas derived from `lba0` upward - use a scratch region.
  * Returns XST_SUCCESS when both passes and the verify succeed.          */
-#define XNVME_BENCH_BYTES      (8u * 1024u * 1024u)     /* per channel */
+#define XNVME_BENCH_BYTES      (128u * 1024u * 1024u)     /* per channel */
 #define XNVME_BENCH_CHUNK      (512u * 1024u)           /* = max_xfer  */
 /* -----------------The benchmark clock ----------------
  * XNvme_TimerInit() brings axi_timer_0 (100 MHz, 10 ns/tick here) up as a

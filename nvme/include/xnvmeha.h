@@ -110,6 +110,22 @@ int  XNvmeHa_PushFullSqe(XNvmeHa *ha, u32 ssd, u32 sq,
                          const XNvmeFullSqe *sqe,
                          void *prp_buf, u32 prp_len);
 
+/* Push a full 64 B SQE whose PRP fields are already final (prebuilt). Same
+ * return contract as XNvmeHa_PushFullSqe (CID, or -1 on no credit / no slot). */
+int  XNvmeHa_PushFullSqePrebuilt(XNvmeHa *ha, u32 ssd, u32 sq,
+                                 const XNvmeFullSqe *sqe, u64 prp1, u64 prp2);
+
+/* Build PRP1/PRP2 for a contiguous buffer into CALLER-provided list storage.
+ * The list must be 8-byte aligned (page alignment recommended) and holds
+ * `list_entries` u64 PRPs. Returns the number of list entries written
+ * (0 when PRP1/PRP2 alone cover the buffer). Does NOT flush the list - the
+ * caller owns the cache maintenance. Reuse the returned PRP1/PRP2 for every
+ * later command on the same buffer via XNvmeHa_SubmitIoPrebuilt, but never
+ * share one list between two in-flight commands.                       */
+u32  XNvmeHa_BuildPrpInto(XNvmeHa *ha, void *buf, u32 len,
+                          u64 *list, u32 list_entries,
+                          u64 *prp1, u64 *prp2);
+
 /* ----------------- Asynchronous I/O (for multi-queue pipelining) ---- */
 
 /* Build + submit one I/O command (read/write/flush) to SSDn / SQm without
@@ -118,6 +134,15 @@ int  XNvmeHa_PushFullSqe(XNvmeHa *ha, u32 ssd, u32 sq,
  * `nlb` must fit a single command (caller splits at MDTS for larger). */
 int  XNvmeHa_SubmitIo(XNvmeHa *ha, u32 ssd, u32 sq, u32 nsid, u64 lba,
                       u16 nlb, void *buf, u32 len, u8 opcode);
+
+/* Submit one I/O command using PREBUILT PRP fields instead of having the
+ * driver rebuild the overflow list per command. PRP mode only (SGL returns
+ * -1). Cache pre-ops, credit/slot retry and slot bookkeeping match
+ * XNvmeHa_SubmitIo. One prebuilt list must never back two in-flight
+ * commands - use one entry per (channel, chunk) slot.                  */
+int  XNvmeHa_SubmitIoPrebuilt(XNvmeHa *ha, u32 ssd, u32 sq, u32 nsid, u64 lba,
+                              u16 nlb, void *buf, u32 len, u8 opcode,
+                              u64 prp1, u64 prp2);
 
 /* Wait for a command submitted via XNvmeHa_SubmitIo to complete, then
  * finalize it: invalidate the buffer for reads and free the slot.

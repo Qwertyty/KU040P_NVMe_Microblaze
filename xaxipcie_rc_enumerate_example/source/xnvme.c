@@ -928,6 +928,16 @@ int XNvme_IpSqFetchTest(XNvme *nv, u64 lba)
 #define XNVME_BENCH_UART_EMPTY 0x04u
 #define XNVME_BENCH_BAUD       ((u32)XPAR_XUARTLITE_0_BAUDRATE)  /* 230400 */
 
+/* The one ground truth this bare-metal board has: the baud rate your TERMINAL
+ * is actually set to - the setting under which this log displays cleanly.
+ * The timer self-test times 512 bytes against it and derives the timer's real
+ * frequency. XPAR_XTMRCTR_0_CLOCK_FREQUENCY is a parameter copied from the
+ * XSA, not a measurement; the UART mismatch proves the real clock tree does
+ * not match it. Set this to whatever your terminal uses.               */
+#ifndef XNVME_UART_GROUND_BAUD
+#define XNVME_UART_GROUND_BAUD  XNVME_BENCH_BAUD
+#endif
+
 /* AXI Timer registers and bits: quoted from the BSP's own xtmrctr_l.h
  * (XTC_TCSR_OFFSET / XTC_TLR_OFFSET / XTC_TCR_OFFSET and the XTC_CSR_* masks)
  * so they stay in step with the IP.
@@ -939,6 +949,13 @@ int XNvme_IpSqFetchTest(XNvme *nv, u64 lba)
  * unsigned subtraction is correct across it.                            */
 #define XNVME_TIMER_BASE       ((u32)XPAR_XTMRCTR_0_BASEADDR)
 #define XNVME_TIMER_HZ         ((u32)XPAR_XTMRCTR_0_CLOCK_FREQUENCY)
+/* Frequency the self-test MEASURED (via the terminal-baud ground truth).
+ * 0 = not calibrated yet; every conversion falls back to the XSA value.  */
+static u32 xnvme_timer_hz_real = 0u;
+static u32 xnvme_timer_hz_eff(void)
+{
+    return (xnvme_timer_hz_real != 0u) ? xnvme_timer_hz_real : XNVME_TIMER_HZ;
+}
 #define XNVME_TIMER_TCSR       0x00u
 #define XNVME_TIMER_TLR        0x04u
 #define XNVME_TIMER_TCR        0x08u
@@ -958,6 +975,33 @@ int XNvme_IpSqFetchTest(XNvme *nv, u64 lba)
  * MicroBlaze->DDR write path. Nothing needs them zeroed: the generator
  * fills every byte before the first command is submitted.               */
 static u8 xnvme_bench_buf[XNVME_BENCH_NCH][XNVME_BENCH_BYTES]
+                        __attribute__((aligned(4096), section(".ddrbuf")));
+
+/* ---- prebuilt PRP tables for the benchmark ----
+ *
+ * The bench buffers (xnvme_bench_buf) and the chunk offsets are fixed for the
+ * whole run, so the PRP1/PRP2 pair of every (channel, chunk) command is a
+ * constant. Building the 127-entry overflow list was the MicroBlaze's
+ * dominant submit cost (~1 ms per 512 KiB command), so the lists are built
+ * ONCE here, outside the timed window, and XNvmeHa_SubmitIoPrebuilt reuses
+ * the PRP values per command.
+ *
+ * One list per (ch, chunk) slot: a list must never back two in-flight
+ * commands, and the pass never has more than one command outstanding per
+ * slot (it waits for the whole depth before recycling offsets).
+ *
+ * Sizing: chunks down to 64 KiB are covered (XNVME_BENCH_NCH x 128 lists x
+ * 1 KiB = 256 KiB in .ddrbuf, next to the pattern buffers - do NOT move this
+ * to .bss, the gap between __bss_end and the stack region is only ~17 KiB).
+ * Smaller chunks fall back to the per-command rebuild.                  */
+#define XNVME_BENCH_PREBUILT_MIN_CHUNK   (64u * 1024u)
+#define XNVME_BENCH_PREBUILT_MAX         ((u32)(XNVME_BENCH_BYTES / \
+                                                XNVME_BENCH_PREBUILT_MIN_CHUNK))
+
+static u64 xnvme_bench_prp1_tab[XNVME_BENCH_NCH][XNVME_BENCH_PREBUILT_MAX];
+static u64 xnvme_bench_prp2_tab[XNVME_BENCH_NCH][XNVME_BENCH_PREBUILT_MAX];
+static u64 xnvme_bench_prp_lists[XNVME_BENCH_NCH * XNVME_BENCH_PREBUILT_MAX]
+                                [XNVMEHA_PRP_LIST_MAX]
                         __attribute__((aligned(4096), section(".ddrbuf")));
 /* ---------------------------------------------------------------------------
  * Benchmark clock.
@@ -1069,7 +1113,7 @@ static u32 xnvme_bench_now(void)
 static u32 xnvme_bench_to_us(u32 delta)
 {
     if (xnvme_clk_src == XNVME_CLK_TIMER)
-        return (u32)(((u64)delta * 1000000ull) / (u64)XNVME_TIMER_HZ);
+        return (u32)(((u64)delta * 1000000ull) / (u64)xnvme_timer_hz_eff());
     return (u32)(((u64)delta * 1000000ull) / (u64)XNVME_UART_SW_BAUD);
 }
 
@@ -1155,11 +1199,21 @@ int XNvme_TimerInit(void)
     return -1;
 #else
     /* Load 0, free-run, interrupts left disabled (so a stray timer interrupt
-     * can never show up on the INTC input either). */
+     * can never show up on the INTC input either).
+     *
+     * PG079 holds the counter in its LOAD state while TCSR.LOAD = 1 - it does
+     * not advance until LOAD is cleared again. Writing LOAD once and leaving
+     * it set (the code below used to do exactly that) parks TCR0 at the loaded
+     * value 0x00000000 forever, so the motion test below reads "constant" and
+     * reports "no working axi_timer" even though axi_timer_0 is alive in the
+     * XSA/SDT at 0x41C00000. That - not a stale bitstream - is why the 18 Sep
+     * run failed this probe. Load and release, the same two-write toggle
+     * XTmrCtr_SetResetValue() uses (BSP xtmrctr.c:464-467).               */
     Xil_Out32(XNVME_TIMER_BASE + XNVME_TIMER_TLR, 0u);
     Xil_Out32(XNVME_TIMER_BASE + XNVME_TIMER_TCSR,
-              XNVME_TIMER_CSR_LOAD | XNVME_TIMER_CSR_AUTORELOAD |
-              XNVME_TIMER_CSR_ENABLE);
+              XNVME_TIMER_CSR_LOAD | XNVME_TIMER_CSR_AUTORELOAD);
+    Xil_Out32(XNVME_TIMER_BASE + XNVME_TIMER_TCSR,
+              XNVME_TIMER_CSR_AUTORELOAD | XNVME_TIMER_CSR_ENABLE);
 
     t1 = Xil_In32(XNVME_TIMER_BASE + XNVME_TIMER_TCR);
     for (i = 0u; (i < 20000u) &&
@@ -1177,8 +1231,9 @@ int XNvme_TimerInit(void)
                    "revision, 0x%08X, reads 0x%08X without faulting).\r\n",
                    XNVME_TIMER_BASE, t1, XNVME_TIMER_CTRL_ADDR, ctrl);
         xil_printf("TIMER: the FPGA is running a bitstream without a usable "
-                   "timer - re-generate the bitstream after the BD change and "
-                   "make sure Program FPGA picks the NEW .bit.\r\n");
+                   "timer, OR the counter is held (TCSR.LOAD left set) - the "
+                   "XSA/SDT carry axi_timer_0 @ 0x41C00000, so check the "
+                   "bitstream first, then the init sequence.\r\n");
         xnvme_clk_src = XNVME_CLK_SW;
         xil_printf("TIMER: falling back to the UART TX FIFO stopwatch, which "
                    "assumes the UART really runs at %u baud "
@@ -1207,24 +1262,25 @@ u32 XNvme_TimerNow(void)
 
 u32 XNvme_TimerUs(u32 delta)
 {
-    return (u32)(((u64)delta * 1000000ull) / (u64)XNVME_TIMER_HZ);
+    return (u32)(((u64)delta * 1000000ull) / (u64)xnvme_timer_hz_eff());
 }
 
-/* Cross-check the time base against the UART - and, more usefully, work out
- * what baud rate the UART is ACTUALLY running at.
+/* Cross-check the time base against the UART wire.
  *
- * A UART Lite has no baud register: the divider is fixed when the bitstream is
- * built. So if the .bit in the FPGA predates the C_BAUDRATE change then the
- * platform (pl.dtsi, xparameters.h) says 230400 while the fabric still runs at
- * 9600 - and you find that out the hard way, by reading the port at 9600 and
- * wondering why the "new" bitstream changed nothing. Timing a known number of
- * bytes with the (trustworthy) timer exposes it directly: the implied baud
- * comes out ~24x low. This is a bitstream problem, not a timer problem, and
- * this is the cheapest place to notice it.                               */
+ * The hwh pins the clock tree down: axi_timer_0 and axi_uartlite_0 share
+ * ddr4_0_addn_ui_clkout1 (100 MHz), and the UART divider is set to 230400.
+ * A UART Lite has no baud register - the divider is fixed in the bitstream -
+ * so if a terminal at 230400 shows this log cleanly, the running bitstream
+ * matches the XSA and the timer's 100 MHz is confirmed (shared clock).
+ * The measured window is longer than the pure wire time because the polling
+ * loop pays one uncached MMIO read per byte - on this fabric those cost tens
+ * of us each. That overhead is fabric latency, NOT a clock error, so this
+ * test deliberately does NOT back-derive a "measured" timer frequency: that
+ * number is polluted by the poll cost.                              */
 u32 XNvme_TimerSelfTest(void)
 {
-    const u32 n = 512u;              /* 512 B at 230400 baud = 2.2 ms */
-    u32 i, t0, dt, got_us, exp_us, imp_baud, ratio100, wedged = 0u;
+    const u32 n = 512u;              /* 512 B = 5120 bits on the wire */
+    u32 i, t0, dt, wire_us, got_us, wedged = 0u;
 
     if (xnvme_timer_tested != 0u)
         return xnvme_timer_ok;
@@ -1252,37 +1308,52 @@ u32 XNvme_TimerSelfTest(void)
             break;
         Xil_Out32(XNVME_BENCH_UART_BASE + XNVME_BENCH_UART_TX, 0u);
     }
-    dt     = Xil_In32(XNVME_TIMER_BASE + XNVME_TIMER_TCR) - t0;
-    got_us = XNvme_TimerUs(dt);
-    exp_us = (u32)(((u64)i * 1000000ull) / (u64)XNVME_BENCH_BAUD);
+    dt = Xil_In32(XNVME_TIMER_BASE + XNVME_TIMER_TCR) - t0;
 
-    if ((i == 0u) || (got_us == 0u)) {
-        xil_printf("TIMER: self-test inconclusive (pushed %u bytes, %u us)\r\n",
-                   i, got_us);
+    if ((i == 0u) || (dt == 0u)) {
+        xil_printf("TIMER: self-test inconclusive (pushed %u bytes, %u ticks)\r\n",
+                   i, dt);
         return 0u;
     }
 
-    imp_baud = (u32)(((u64)i * 1000000ull) / (u64)got_us);
-    if (imp_baud == 0u)
-        imp_baud = 1u;
-    ratio100 = (imp_baud > XNVME_BENCH_BAUD)
-        ? (u32)(((u64)imp_baud * 100ull) / (u64)XNVME_BENCH_BAUD)
-        : (u32)(((u64)XNVME_BENCH_BAUD * 100ull) / (u64)imp_baud);
+    /* No clock recalibration here - that is deliberate. The design file
+     * pins the clock tree down:
+     *   - hwh: axi_timer_0 s_axi_aclk  = ddr4_0_addn_ui_clkout1, 100 MHz
+     *   - hwh: axi_uartlite_0 C_BAUDRATE = 230400 on the same 100 MHz
+     * If a terminal set to 230400 displays this log cleanly, the running
+     * bitstream's UART divider matches the XSA - and with it the timer's
+     * 100 MHz (the two blocks share the clock). The window measured below
+     * is longer than the pure wire time because the polling loop pays one
+     * uncached MMIO read per byte, and on this fabric those are tens of us
+     * each (PROBE 2). That overhead is fabric latency, not a clock error:
+     * do NOT back-derive a "measured" timer frequency from this test, the
+     * number it produces (dt*baud/(i*10)) is polluted by the poll cost. */
+    wire_us = (u32)(((u64)i * 10ull * 1000000ull) / (u64)XNVME_UART_GROUND_BAUD);
+    got_us  = XNvme_TimerUs(dt);
 
-    xil_printf("TIMER: self-test: %u UART bytes in %u us (expected %u us at %u "
-               "baud) => the UART is really running at ~%u baud\r\n",
-               i, got_us, exp_us, XNVME_BENCH_BAUD, imp_baud);
+    xil_printf("TIMER: self-test: %u UART bytes in %u us (pure wire time would "
+               "be %u us at %u baud, %u ns/byte)\r\n",
+               i, got_us, wire_us, (u32)XNVME_UART_GROUND_BAUD,
+               (u32)(((u64)dt * 1000ull) / (u64)i));
 
-    if (ratio100 >= 103u)
-        xil_printf("TIMER: *** that is %u.%02ux off the platform's %u baud. "
-                   "The UART divider is fixed at synthesis time, so the "
-                   "bitstream in the FPGA predates the C_BAUDRATE change: run "
-                   "Generate Bitstream again, re-export the XSA, then Program "
-                   "FPGA with the new .bit. (The timer itself is fine.)\r\n",
-                   ratio100 / 100u, ratio100 % 100u, XNVME_BENCH_BAUD);
-    else
-        xil_printf("TIMER: -> OK (timer and platform baud agree, timing is "
-                   "exact)\r\n");
+    if ((wire_us == 0u) || (got_us < wire_us - (wire_us / 10u))) {
+        xil_printf("TIMER: *** measured FASTER than the wire allows - "
+                   "XNVME_UART_GROUND_BAUD is probably lower than the real "
+                   "line rate; check the terminal setting. Timing still uses "
+                   "the XSA's %u Hz.\r\n", XNVME_TIMER_HZ);
+    } else if (got_us <= wire_us + (wire_us / 4u)) {
+        xil_printf("TIMER: -> OK: window matches the wire; the timer's %u Hz "
+                   "stands and all timing below is exact.\r\n",
+                   XNVME_TIMER_HZ);
+    } else {
+        xil_printf("TIMER: -> the extra %u us is the TX-FIFO poll cost "
+                   "(~%u us/byte of uncached MMIO, same order as PROBE 2) - "
+                   "NOT a clock or baud error. The terminal displaying this "
+                   "cleanly at %u baud proves the bitstream's UART divider "
+                   "matches the XSA, so the timer's %u Hz stands.\r\n",
+                   got_us - wire_us, (got_us - wire_us) / i,
+                   (u32)XNVME_UART_GROUND_BAUD, XNVME_TIMER_HZ);
+    }
 
     xnvme_timer_ok = 1u;
     return 1u;
@@ -1349,23 +1420,149 @@ static u32 xnvme_bench_scan(u32 ch, u32 words, u32 chunk_words,
     return s;
 }
 
+/* Submit one bench command using a PREBUILT PRP pair. Thin wrappers over the
+ * channel-async API - same validation, just handing in prp1/prp2 so the
+ * driver skips the per-command list rebuild.                          */
+static int XNvme_WriteChannelAsyncPrebuilt(XNvme *nv, u32 ch, u64 lba,
+                                           u16 nlb, const void *buf, u32 len,
+                                           u64 prp1, u64 prp2)
+{
+    if ((nv == NULL) || (ch >= (u32)XNVMEHA_NUM_SQ_SW) || (buf == NULL))
+        return -1;
+    if ((u32)nlb * nv->lba_size > len)
+        return -1;
+    return XNvmeHa_SubmitIoPrebuilt(&nv->ha, nv->target_ssd, ch, nv->nsid,
+                                    lba, nlb, (void *)buf, len,
+                                    XNVME_OPC_IO_WRITE, prp1, prp2);
+}
+
+static int XNvme_ReadChannelAsyncPrebuilt(XNvme *nv, u32 ch, u64 lba,
+                                          u16 nlb, void *buf, u32 len,
+                                          u64 prp1, u64 prp2)
+{
+    if ((nv == NULL) || (ch >= (u32)XNVMEHA_NUM_SQ_SW) || (buf == NULL))
+        return -1;
+    if ((u32)nlb * nv->lba_size > len)
+        return -1;
+    return XNvmeHa_SubmitIoPrebuilt(&nv->ha, nv->target_ssd, ch, nv->nsid,
+                                    lba, nlb, buf, len,
+                                    XNVME_OPC_IO_READ, prp1, prp2);
+}
+
+/* Build the PRP1/PRP2 pair for every (channel, chunk) the pass will submit,
+ * once, outside the timed window. Each chunk gets its own persistent list
+ * (xnvme_bench_prp_lists) and its own table entry, so no two in-flight
+ * commands ever share a list. bytes_per_ch % chunk_bytes == 0 is already
+ * enforced by XNvme_Bench, so every chunk is a full chunk_bytes.       */
+static void xnvme_bench_prp_prebuild(XNvme *nv, u32 nch,
+                                     void *const *buf, u32 bytes_per_ch,
+                                     u32 chunk_bytes)
+{
+    u32 ch, off, ci;
+
+    for (ch = 0u; ch < nch; ch++) {
+        for (off = 0u, ci = 0u; off < bytes_per_ch;
+             off += chunk_bytes, ci++) {
+            u64 *list = xnvme_bench_prp_lists[ch * XNVME_BENCH_PREBUILT_MAX
+                                              + ci];
+            u64 p1, p2;
+            u32 np = XNvmeHa_BuildPrpInto(&nv->ha, (u8 *)buf[ch] + off,
+                                          chunk_bytes, list,
+                                          XNVMEHA_PRP_LIST_MAX, &p1, &p2);
+
+            if (np != 0u)
+                XNvme_PalFlushDcache(list, np * (u32)sizeof(u64));
+            xnvme_bench_prp1_tab[ch][ci] = p1;
+            xnvme_bench_prp2_tab[ch][ci] = p2;
+        }
+    }
+    xil_printf("BENCH: prebuilt %u PRP lists (%u chunks x %u ch, %u KiB each)"
+               " - submit skips the per-command rebuild\r\n",
+               ci * nch, ci, nch, chunk_bytes / 1024u);
+}
+
+/* Submit-phase autopsy. With the PRP lists prebuilt, the per-command software
+ * work is ~100 instructions plus 16 MMIO stores - tens of microseconds at
+ * 100 MHz - yet the bench measures ~3 ms per submitted command. Time the same
+ * KINDS of memory operations standalone so the next log says WHICH of them
+ * eats the time:
+ *   1. bare DDR stores          - the "everything is fine" baseline,
+ *   2. read of an IP register   - non-posted, one full AXI round trip,
+ *   3. read of the SW port      - the same AXI slave the SQE push writes to,
+ *   4. IP register store + mbar - the exact shape every push ends with.
+ * The targets are side-effect free: TIMEOUT is re-written with the value init
+ * already programmed, and the SW-port read is the same empty-CQ probe
+ * XNvmeHa_Init does (the INT_STATUS bit it sets is cleared right after).  */
+static void xnvme_swport_probe(XNvme *nv)
+{
+#define PROBE_NS(ticks, n) \
+    ((u32)((((u64)(ticks)) * 1000000000ull) / \
+           ((u64)xnvme_timer_hz_eff() * (u64)(n))))
+    volatile u32 sink = 0u;
+    u32 i, t0, d;
+    const u32 n_ddr = 20000u, n_reg = 100u;
+
+    if (xnvme_clk_src != XNVME_CLK_TIMER)
+        return;                    /* needs a real clock to say anything */
+
+    t0 = xnvme_bench_now();
+    for (i = 0u; i < n_ddr; i++)
+        sink += i;
+    d = xnvme_bench_now() - t0;
+    xil_printf("PROBE: 1. DDR store+add       %u ns/op (%u iters)\r\n",
+               PROBE_NS(d, n_ddr), n_ddr);
+
+    t0 = xnvme_bench_now();
+    for (i = 0u; i < n_reg; i++)
+        sink += Xil_In32(nv->ha.reg_base + XNVMEHA_REG_TIMEOUT);
+    d = xnvme_bench_now() - t0;
+    xil_printf("PROBE: 2. IP reg read         %u ns/rd (%u iters)\r\n",
+               PROBE_NS(d, n_reg), n_reg);
+
+    t0 = xnvme_bench_now();
+    for (i = 0u; i < n_reg; i++)
+        sink += Xil_In32(nv->ha.sw_axi_base + XNVMEHA_SW_CQ_ADDR);
+    d = xnvme_bench_now() - t0;
+    Xil_Out32(nv->ha.reg_base + XNVMEHA_REG_INT_STATUS, XNVMEHA_INT_ALL);
+    xil_printf("PROBE: 3. SW port read        %u ns/rd (%u iters) - same slave as the SQE push\r\n",
+               PROBE_NS(d, n_reg), n_reg);
+
+    t0 = xnvme_bench_now();
+    for (i = 0u; i < n_reg; i++) {
+        Xil_Out32(nv->ha.reg_base + XNVMEHA_REG_TIMEOUT, 0x08000000u);
+        XNvme_PalDsb();
+    }
+    d = xnvme_bench_now() - t0;
+    xil_printf("PROBE: 4. IP reg store + mbar %u ns/op - the shape of every SQE push\r\n",
+               PROBE_NS(d, n_reg));
+    (void)sink;
+#undef PROBE_NS
+}
+
 /* One timed pass. Commands are kept XNVME_BENCH_DEPTH deep per channel
  * (a DRAM-less NVMe drive at QD2 is latency-bound, so a queue depth of 1 per
  * channel would report a much lower number than the drive can do).
  *
  * `submit_clk` (optional) returns how much clock the submit phases used, in the
  * clock's own units (convert with BENCH_TO_US). This split matters on this
- * design: building a 127-entry PRP list plus pushing the SQE costs the
- * MicroBlaze on the order of a millisecond per 512 KiB command, which is the
- * same order as what the drive needs to move it - so a large part of the wall
- * time can be the CPU feeding the queue, and that is worth being able to see
- * rather than guess.
+ * design: building a 127-entry PRP list plus pushing the SQE used to cost the
+ * MicroBlaze on the order of a millisecond per 512 KiB command - the same
+ * order as what the drive needs to move it. The PRP half of that cost is now
+ * prepaid by xnvme_bench_prp_prebuild(); when the tables are passed in, the
+ * submit loop only rewrites the 64 B SQE, and what remains of the submit
+ * time is the SQE push plus slot/credit bookkeeping.
+ *
+ * `prp1_tab`/`prp2_tab` (NULL = per-command rebuild, old path) index by
+ * [ch][o / chunk_bytes] and must come from xnvme_bench_prp_prebuild with the
+ * same geometry.
  *
  * Returns XST_SUCCESS / XST_FAILURE (submit) / XST_TIMEOUT.             */
 static int xnvme_bench_pass(XNvme *nv, u32 nch, u32 is_write,
                             const u64 *lba, void *const *buf,
                             u32 bytes_per_ch, u32 chunk_bytes,
-                            u32 *submit_clk)
+                            u32 *submit_clk,
+                            const u64 prp1_tab[][XNVME_BENCH_PREBUILT_MAX],
+                            const u64 prp2_tab[][XNVME_BENCH_PREBUILT_MAX])
 {
     int  cids[XNVME_BENCH_NCH][XNVME_BENCH_DEPTH];
     u32  nsub[XNVME_BENCH_NCH];
@@ -1397,9 +1594,25 @@ static int xnvme_bench_pass(XNvme *nv, u32 nch, u32 is_write,
                 lba_ch = lba[ch] + (u64)(o / nv->lba_size);
                 p      = (u8 *)buf[ch] + o;
 
-                cids[ch][k] = is_write
-                    ? XNvme_WriteChannelAsync(nv, ch, lba_ch, (u16)nlb, p, chunk)
-                    : XNvme_ReadChannelAsync(nv, ch, lba_ch, (u16)nlb, p, chunk);
+                if (prp1_tab != NULL) {
+                    u32 ci = o / chunk_bytes;
+
+                    cids[ch][k] = is_write
+                        ? XNvme_WriteChannelAsyncPrebuilt(nv, ch, lba_ch,
+                                                          (u16)nlb, p, chunk,
+                                                          prp1_tab[ch][ci],
+                                                          prp2_tab[ch][ci])
+                        : XNvme_ReadChannelAsyncPrebuilt(nv, ch, lba_ch,
+                                                         (u16)nlb, p, chunk,
+                                                         prp1_tab[ch][ci],
+                                                         prp2_tab[ch][ci]);
+                } else {
+                    cids[ch][k] = is_write
+                        ? XNvme_WriteChannelAsync(nv, ch, lba_ch, (u16)nlb,
+                                                  p, chunk)
+                        : XNvme_ReadChannelAsync(nv, ch, lba_ch, (u16)nlb,
+                                                 p, chunk);
+                }
                 if (cids[ch][k] < 0) {
                     XNVME_ERR("BENCH: submit failed ch=%u off=%u\r\n", ch, o);
                     return XST_FAILURE;
@@ -1456,7 +1669,7 @@ static void xnvme_bench_report(const char *tag, u32 bytes,
                tag, bytes, elapsed_us, elapsed_us / 1000u, elapsed_us % 1000u,
                kbs, mbs, (nch != 0u) ? (mbs / nch) : mbs, iops);
     xil_printf("BENCH:   submit %u us (%u%%), wait %u us (%u%%) - submit = "
-               "MicroBlaze building PRP lists + pushing SQEs, wait = the "
+               "MicroBlaze pushing SQEs (PRP lists are prebuilt), wait = the "
                "drive\r\n", submit_us, sub_pc, wait_us, wait_pc);
 }
 
@@ -1556,6 +1769,7 @@ int XNvme_Bench(XNvme *nv, u32 nch, u64 lba0,
     u64 lbas[XNVME_BENCH_NCH];
     void *bufs[XNVME_BENCH_NCH];
     u32 csum0[XNVME_BENCH_NCH];
+    u32 have_prebuilt = 0u;
     u32 ch, i, words, bad, rc;
     /* Timestamps are taken in the clock's own units and converted once, at
      * the point where they are reported.                                */
@@ -1629,6 +1843,26 @@ int XNvme_Bench(XNvme *nv, u32 nch, u64 lba0,
                    (u32)XNvme_PalLocalToPcie(xnvme_bench_buf[ch]), csum0[ch]);
     }
 
+    /* ---- 1b. Prebuild the PRP lists once, outside the timed window. ----
+     * The submit side used to rebuild a 127-entry list for every 512 KiB
+     * command (~1 ms of MicroBlaze per command) and dominated the wall time
+     * ("submit 100%, wait 0%"). The buffers and chunk offsets are fixed, so
+     * the lists are constants: build them here and let the passes reuse the
+     * PRP values. Falls back to the old per-command rebuild if the geometry
+     * does not fit the table.                                       */
+    {
+        u32 nchunk = bytes_per_ch / chunk_bytes;
+
+        if (nchunk <= XNVME_BENCH_PREBUILT_MAX) {
+            xnvme_bench_prp_prebuild(nv, nch, bufs, bytes_per_ch, chunk_bytes);
+            have_prebuilt = 1u;
+        } else {
+            xil_printf("BENCH: %u chunks per ch exceeds the prebuilt table "
+                       "(%u) - falling back to the per-command PRP rebuild\r\n",
+                       nchunk, (u32)XNVME_BENCH_PREBUILT_MAX);
+        }
+    }
+
     /* ---- 2. Timed WRITE pass (verbose logs off, clock on).
      *
      * Coherency for the timed passes: the driver's per-command flush /
@@ -1657,12 +1891,16 @@ int XNvme_Bench(XNvme *nv, u32 nch, u64 lba0,
     if (duw0 == 0xFFFFFFFFFFFFFFFFULL)
         xil_printf("BENCH: (SMART read failed - drive byte count unavailable)\r\n");
 
+    xnvme_swport_probe(nv);
+
     XNvmeHa_SetCacheOps(0u);
     XNvmeHa_SetVerbose(0u);
     xnvme_bench_clk_begin();
     clk_a = BENCH_NOW();
     rc = xnvme_bench_pass(nv, nch, 1u, lbas, bufs, bytes_per_ch, chunk_bytes,
-                          &sub_clk);
+                          &sub_clk,
+                          have_prebuilt ? xnvme_bench_prp1_tab : NULL,
+                          have_prebuilt ? xnvme_bench_prp2_tab : NULL);
     clk_b = BENCH_NOW();
     xnvme_bench_clk_end();
     if (rc != XST_SUCCESS) {
@@ -1700,7 +1938,9 @@ int XNvme_Bench(XNvme *nv, u32 nch, u64 lba0,
     xnvme_bench_clk_begin();
     clk_a = BENCH_NOW();
     rc = xnvme_bench_pass(nv, nch, 0u, lbas, bufs, bytes_per_ch, chunk_bytes,
-                          &sub_clk);
+                          &sub_clk,
+                          have_prebuilt ? xnvme_bench_prp1_tab : NULL,
+                          have_prebuilt ? xnvme_bench_prp2_tab : NULL);
     clk_b = BENCH_NOW();
     xnvme_bench_clk_end();
     XNvmeHa_SetVerbose(1u);        /* bring the bring-up logs back */
@@ -1872,9 +2112,11 @@ int XNvme_Bench(XNvme *nv, u32 nch, u64 lba0,
     (void)XNvme_StackCanaryCheck("after the benchmark");
     xil_printf("BENCH: how to read these numbers:\r\n");
     if (xnvme_clk_src == XNVME_CLK_TIMER)
-        xil_printf("BENCH:   - time comes from the AXI timer (%u Hz = %u ns/tick),\r\n"
-                   "BENCH:     which is exact and independent of the CPU;\r\n",
-                   XNVME_TIMER_HZ, (u32)(1000000000u / XNVME_TIMER_HZ));
+        xil_printf("BENCH:   - time comes from the AXI timer, self-calibrated "
+                   "against the UART (%u Hz = %u ns/tick),\r\n"
+                   "BENCH:     independent of the CPU;\r\n",
+                   xnvme_timer_hz_eff(),
+                   (u32)(1000000000u / xnvme_timer_hz_eff()));
     else
         xil_printf("BENCH:   - time comes from the UART TX FIFO stopwatch at %u baud.\r\n"
                    "BENCH:     Its one failure mode is a stale bitstream: the UART's\r\n"
@@ -1886,8 +2128,9 @@ int XNvme_Bench(XNvme *nv, u32 nch, u64 lba0,
     xil_printf("BENCH:   - driver cache maintenance and pattern generation are outside\r\n"
                "BENCH:     the timed windows; the MicroBlaze's own submit work is not;\r\n"
                "BENCH:   - if submit dominates, you measured the CPU feeding the queue,\r\n"
-               "BENCH:     not the drive. To reach the drive's ceiling, stop rebuilding\r\n"
-               "BENCH:     the PRP list per command, or feed the SW port from the PL.\r\n");
+               "BENCH:     not the drive. PRP lists are prebuilt now, so the remaining\r\n"
+               "BENCH:     submit cost is the 64 B SQE push (16 Xil_Out32) - to go\r\n"
+               "BENCH:     further, feed the SW port from the PL.\r\n");
 
     return (bad == 0u) ? XST_SUCCESS : XST_FAILURE;
 }

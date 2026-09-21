@@ -67,7 +67,10 @@ set(USER_COMPILE_WARNINGS_INHIBIT_ALL )
 # -----------------------------------------
 
 # Optimization level   "-O0" [None], "-O1" [Optimize] , "-O2" [Optimize More], "-O3" [Optimize Most] or "-Os" [Optimize Size]
-set(USER_COMPILE_OPTIMIZATION_LEVEL -O0)
+# -O2: the submit path is latency-sensitive and the driver's IO regions are
+# uncached by address range, so volatile-MMIO access patterns are preserved.
+# Do NOT go to -O3: on MicroBlaze it risks larger code with no latency win.
+set(USER_COMPILE_OPTIMIZATION_LEVEL -O2)
 
 # Other flags related to optimization
 set(USER_COMPILE_OPTIMIZATION_OTHER_FLAGS )

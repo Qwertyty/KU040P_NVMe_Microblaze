@@ -247,6 +247,57 @@ void XNvmeHa_SetTransferMode(XNvmeHa *ha, u8 use_sgl)
     ha->use_sgl = use_sgl ? 1u : 0u;
 }
 
+/* Core of the PRP builder, shared by two callers:
+ *
+ *  - XNvmeHa_BuildPrp(): passes a per-slot list (see xnvmeha_prp_list) and
+ *    flushes it - the general per-command path.
+ *  - XNvmeHa_SubmitIoPrebuilt() users: build into their OWN persistent storage
+ *    once, outside any timed window, then reuse the returned PRP1/PRP2 for
+ *    every later command on the same buffer. The benchmark used to rebuild a
+ *    127-entry list per command, which at ~1 ms per 512 KiB command was the
+ *    MicroBlaze's dominant submit cost (xnvme.c bench comments).
+ *
+ * `list` holds `list_entries` u64 PRPs and must be 8-byte aligned (page
+ * alignment is recommended; the IP fetches it from DDR through PRP2).
+ * Returns the number of list entries written - 0 when PRP1/PRP2 alone covered
+ * the buffer (len <= 2 pages) and no list was touched. Does NOT flush `list`;
+ * the caller owns the cache maintenance.                                    */
+u32 XNvmeHa_BuildPrpInto(XNvmeHa *ha, void *buf, u32 len,
+                         u64 *list, u32 list_entries,
+                         u64 *prp1, u64 *prp2)
+{
+    u64 base = XNvme_PalLocalToPcie(buf);
+    u32 page = ha->prp_page_size ? ha->prp_page_size : 4096u;
+    u32 offset = (u32)(base & (u64)(page - 1u));
+    u32 first = page - offset;            /* bytes in 1st page */
+    u32 remaining, npages, i;
+    u64 second_page;
+
+    *prp1 = base;
+    *prp2 = 0;
+
+    if (len <= first)
+        return 0u;                        /* single page, PRP1 only */
+
+    remaining = len - first;
+    npages = (remaining + page - 1u) / page;
+    second_page = (base & ~(u64)(page - 1u)) + page;
+
+    if (npages == 1u) {
+        *prp2 = second_page;              /* one extra page: pointer directly */
+        return 0u;
+    }
+
+    if (npages > list_entries)
+        npages = list_entries;            /* caller must have split at MDTS */
+
+    for (i = 0u; i < npages; i++)
+        list[i] = second_page + (u64)i * page;
+
+    *prp2 = XNvme_PalLocalToPcie(list);
+    return npages;
+}
+
 /* Build PRP1/PRP2 for a contiguous buffer of `len` bytes starting at the
  * PCIe address of `buf`. Returns the PRP1 and PRP2 values to place in the
  * full 64-byte SQE (DW6/DW7 = PRP1, DW8/DW9 = PRP2).
@@ -257,40 +308,13 @@ void XNvmeHa_SetTransferMode(XNvmeHa *ha, u8 use_sgl)
 static void XNvmeHa_BuildPrp(XNvmeHa *ha, void *buf, u32 len,
                              u64 *prp1, u64 *prp2, u32 slot)
 {
-    u64 base = XNvme_PalLocalToPcie(buf);
-    u32 page = ha->prp_page_size ? ha->prp_page_size : 4096u;
-    u32 offset = (u32)(base & (u64)(page - 1u));
-    u32 first = page - offset;            /* bytes in 1st page */
-    u32 remaining, npages, i;
-    u64 second_page;
-    u64 *list;
-
-    *prp1 = base;
-    *prp2 = 0;
-
-    if (len <= first)
-        return;                       /* single page, PRP1 only */
-
-    remaining = len - first;
-    npages = (remaining + page - 1u) / page;
-    second_page = (base & ~(u64)(page - 1u)) + page;
-
-    if (npages == 1u) {
-        *prp2 = second_page;          /* one extra page: pointer directly */
-        return;
-    }
-
-    if (npages > XNVMEHA_PRP_LIST_MAX)
-        npages = XNVMEHA_PRP_LIST_MAX; /* caller must have split at MDTS */
-
     /* This command's own list - see the note on xnvmeha_prp_list. */
-    list = xnvmeha_prp_list[slot % XNVMEHA_MAX_OUTSTANDING];
+    u64 *list = xnvmeha_prp_list[slot % XNVMEHA_MAX_OUTSTANDING];
+    u32 npages = XNvmeHa_BuildPrpInto(ha, buf, len, list,
+                                      XNVMEHA_PRP_LIST_MAX, prp1, prp2);
 
-    for (i = 0u; i < npages; i++)
-        list[i] = second_page + (u64)i * page;
-
-    XNvme_PalFlushDcache(list, npages * (u32)sizeof(u64));
-    *prp2 = XNvme_PalLocalToPcie(list);
+    if (npages != 0u)
+        XNvme_PalFlushDcache(list, npages * (u32)sizeof(u64));
 }
 
 /* ----------------- command-id / slot management ----------------- */
@@ -455,6 +479,43 @@ int XNvmeHa_PushFullSqe(XNvmeHa *ha, u32 ssd, u32 sq,
             q.prp2_hi = (u32)(p2 >> 32);
         }
 
+        q.dw0 = (q.dw0 & 0x0000FFFFu) | ((u32)cid << 16);
+        XNvmeHa_PushWords(ha, ssd, sq, (const u32 *)&q,
+                          (XNVMEHA_SQE_BYTES / 4u));
+    }
+    ha->sw_credit[ssd]--;
+    return cid;
+}
+
+/* Push a full 64 B SQE whose PRP fields are ALREADY final.
+ *
+ * Same contract as XNvmeHa_PushFullSqe, but the caller supplies PRP1/PRP2
+ * (typically from XNvmeHa_BuildPrpInto into persistent storage) instead of a
+ * buffer, so no list is built or flushed per command. Only the CID still has
+ * to be patched in after AllocSlot - same as the buffer-driven variant.     */
+int XNvmeHa_PushFullSqePrebuilt(XNvmeHa *ha, u32 ssd, u32 sq,
+                                const XNvmeFullSqe *sqe, u64 prp1, u64 prp2)
+{
+    int cid;
+
+    if ((ha == NULL) || (sqe == NULL) || (ssd >= XNVMEHA_MAX_SSD))
+        return -1;
+    if (sq >= XNVMEHA_MAX_SQ)
+        return -1;
+    if (ha->sw_credit[ssd] == 0u)
+        return -1;
+
+    cid = XNvmeHa_AllocSlot(ha, ssd);
+    if (cid < 0)
+        return -1;
+
+    {
+        XNvmeFullSqe q = *sqe;
+
+        q.prp1_lo = (u32)prp1;
+        q.prp1_hi = (u32)(prp1 >> 32);
+        q.prp2_lo = (u32)prp2;
+        q.prp2_hi = (u32)(prp2 >> 32);
         q.dw0 = (q.dw0 & 0x0000FFFFu) | ((u32)cid << 16);
         XNvmeHa_PushWords(ha, ssd, sq, (const u32 *)&q,
                           (XNVMEHA_SQE_BYTES / 4u));
@@ -818,6 +879,78 @@ int XNvmeHa_SubmitIo(XNvmeHa *ha, u32 ssd, u32 sq, u32 nsid, u64 lba,
      * (qid = sq + 1) and DispatchCqe refuses a completion that comes back with
      * a different one, so a replayed CQE cannot mark someone else's command
      * as done.                                                          */
+    ha->slot[cid].buf      = buf;
+    ha->slot[cid].xfer_len = len;
+    ha->slot[cid].is_read  = (opcode == XNVME_OPC_IO_READ) ? 1u : 0u;
+    ha->slot[cid].sqid     = (u16)(sq + 1u);
+    return cid;
+}
+
+/* Submit one I/O command with PREBUILT PRP fields.
+ *
+ * Same contract as XNvmeHa_SubmitIo, except the caller hands in the final
+ * PRP1/PRP2 values (from XNvmeHa_BuildPrpInto into persistent storage) instead
+ * of having the driver rebuild the overflow list on every command. PRP mode
+ * only - SGL mode has no list to prebuild. Everything else matches
+ * XNvmeHa_SubmitIo: cache pre-ops on the data buffer, credit/slot retry loop,
+ * and the slot bookkeeping XNvmeHa_WaitIo relies on.
+ *
+ * SAFETY: a prebuilt list must never be shared by two in-flight commands -
+ * the IP walks the list in DDR while the command runs. The benchmark uses one
+ * table entry per (channel, chunk) and never overlaps them.               */
+int XNvmeHa_SubmitIoPrebuilt(XNvmeHa *ha, u32 ssd, u32 sq, u32 nsid, u64 lba,
+                             u16 nlb, void *buf, u32 len, u8 opcode,
+                             u64 prp1, u64 prp2)
+{
+    XNvmeFullSqe sqe;
+    u32 n, spin;
+    int cid;
+
+    if ((ha == NULL) || (ssd >= XNVMEHA_MAX_SSD) || (sq >= XNVMEHA_MAX_SQ))
+        return -1;
+    if (ha->use_sgl)
+        return -1;                 /* prebuilt PRPs are a PRP-mode thing */
+    if ((buf == NULL) && (opcode != XNVME_OPC_IO_FLUSH))
+        return -1;
+
+    /* Same coherency contract as XNvmeHa_SubmitIo (the benchmark runs with
+     * XNvmeHa_SetCacheOps(0) and manages the data buffer itself).        */
+    if (xnvmeha_cache_ops != 0u) {
+        if (opcode == XNVME_OPC_IO_WRITE)
+            XNvme_PalFlushDcache(buf, len);
+        else if (opcode == XNVME_OPC_IO_READ)
+            XNvme_PalInvalidateDcache(buf, len);
+    }
+
+    n = nlb ? (u32)nlb : 1u;
+
+    memset(&sqe, 0, sizeof(sqe));
+    sqe.dw0     = (u32)opcode;
+    sqe.nsid    = nsid;
+    sqe.slba_lo = (u32)lba;
+    sqe.slba_hi = (u32)(lba >> 32);
+    sqe.nlb     = (n - 1u) & 0xFFFFu;
+    sqe.prp1_lo = (u32)prp1;
+    sqe.prp1_hi = (u32)(prp1 >> 32);
+    sqe.prp2_lo = (u32)prp2;
+    sqe.prp2_hi = (u32)(prp2 >> 32);
+
+    spin = 0u;
+    do {
+        cid = XNvmeHa_PushFullSqePrebuilt(ha, ssd, sq, &sqe, prp1, prp2);
+        if (cid < 0) {
+            if (XNvmeHa_WaitHook != NULL)
+                XNvmeHa_WaitHook();
+            /* Same guard as the other submit paths. */
+            if (++spin > 0x100000u) {
+                XNVMEHA_ERR("NVMeHA: submit(prebuilt) stuck sq=%u credit=%u\r\n",
+                            sq, ha->sw_credit[ssd]);
+                return -1;
+            }
+            XNvmeHa_ServiceInterrupts(ha);
+        }
+    } while (cid < 0);
+
     ha->slot[cid].buf      = buf;
     ha->slot[cid].xfer_len = len;
     ha->slot[cid].is_read  = (opcode == XNVME_OPC_IO_READ) ? 1u : 0u;

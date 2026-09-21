@@ -371,6 +371,20 @@ int main(void)
 	 * Keep it - it costs one line of output and saves a whole round trip. */
 	xil_printf("\r\nBOOT: main() entered\r\n");
 
+	/* Enable the caches. Until now NOTHING in this application ever called
+	 * these, so every instruction fetch has been an AXI read to DDR and
+	 * every DDR store an uncached single beat - that dominated all earlier
+	 * measurements (e.g. the SW-port probe numbers). Safe here by config:
+	 * the cacheable window is 0x80000000-0xFFFFFFFF (DDR only,
+	 * xparameters.h XPAR_MICROBLAZE_D/I_CACHE_BASEADDR) and every device
+	 * region (swaxi 0x44A00000, NVMeHA regs, UART, timer, PCIe BARs) sits
+	 * below it, so Xil_Out32/Xil_In32 keep their uncached semantics. The
+	 * driver's coherency code (PRP-list flush, read-buffer invalidate,
+	 * admin SQE/CQE maintenance) has always been in place and now becomes
+	 * load-bearing.                                          */
+	Xil_ICacheEnable();
+	// Xil_DCacheEnable();
+
 	/* Arm the stack-overflow canary as early as possible: from here on, any
 	 * call chain that runs below the stack's bottom edge is caught and
 	 * reported rather than silently corrupting whatever lies there. */

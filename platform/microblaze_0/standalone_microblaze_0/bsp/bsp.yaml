@@ -1,7 +1,7 @@
 sdt: hw_artifacts/microblaze_0_baremetal.dts
 family: kintexu
 path: C:\Users\qwerty\Desktop\yscc_proj6\platform\microblaze_0\standalone_microblaze_0\bsp
-config: None
+config: default
 os: standalone
 os_info:
   standalone:
