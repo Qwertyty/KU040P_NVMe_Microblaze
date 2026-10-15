@@ -28,3 +28,5 @@ comp.build()
 
 status = comp.clean()
 
+vitis.dispose()
+

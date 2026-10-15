@@ -1921,12 +1921,15 @@ int XNvme_Bench(XNvme *nv, u32 nch, u64 lba0,
         u64 d = ((duw0 == 0xFFFFFFFFFFFFFFFFULL) ||
                  (duw1 == 0xFFFFFFFFFFFFFFFFULL)) ? 0ULL : (duw1 - duw0);
 
+        u32 exp_cmds = (bytes_per_ch / chunk_bytes) * nch;
+
         xil_printf("BENCH: witness after WRITE -> IP issued +%u completed +%u "
                    "err +%u | driver popped +%u CQE | drive wrote +%u units\r\n",
                    iss1 - iss0, cmp1 - cmp0, err1 - err0,
                    svc1 - svc0, (u32)d);
-        xil_printf("BENCH:   (expected for 16 MiB: issued +32, completed +32, "
-                   "drive +32..33 units of 1000x512 B)\r\n");
+        xil_printf("BENCH:   (expected: issued +%u, completed +%u, drive "
+                   "+%u..%u units of 1000x512 B)\r\n",
+                   exp_cmds, exp_cmds, exp_cmds, exp_cmds + 2u);
     }
 
     /* Push the drive's cache out before reading - NOT part of the timed
